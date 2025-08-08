@@ -34,6 +34,7 @@ start_A = 0
 start_B = 0
 recording = False
 record_data = []
+record_filename = f"angle_record_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
 start_time = None
 
 def angle_between(p1, p2):
@@ -217,4 +218,3 @@ while cap.isOpened():
 cap.release()
 out.release()
 cv2.destroyAllWindows()
-
