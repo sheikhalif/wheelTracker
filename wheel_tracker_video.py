@@ -1,0 +1,194 @@
+import cv2
+import numpy as np
+import sys
+import time
+import csv
+from datetime import datetime
+
+if len(sys.argv) < 2:
+    print("Usage: python3 wheel_tracker.py <video_file> [frame_skip]")
+    print("  frame_skip: process every Nth frame (default 1, try 5-10 for speed)")
+    sys.exit(1)
+
+video_path = sys.argv[1]
+skip = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+
+
+# HSV range for green marker detection (adjust if needed)
+green_lower = np.array([40, 60, 60])
+green_upper = np.array([90, 255, 255])
+
+# Angular label font
+font = cv2.FONT_HERSHEY_SIMPLEX
+
+# Read input video
+cap = cv2.VideoCapture(video_path)
+
+initialized = False
+init_time = None
+label_A, label_B = None, None
+angle_diff = None
+avg_length = None
+center_point = None
+rotation_direction = None
+start_A = 0
+start_B = 0
+recording = True
+record_data = []
+record_filename = f"angle_record_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+start_time = None
+
+def angle_between(p1, p2):
+    dx, dy = p2[0]-p1[0], p1[1]-p2[1]
+    angle = np.degrees(np.arctan2(dy, dx)) % 360
+    return angle
+
+def midpoint(p1, p2):
+    return ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2)
+
+def draw_angle_line(img, center, pt, color, label):
+    cv2.line(img, center, pt, color, 2)
+    angle = angle_between(center, pt)
+    label_pos = (pt[0]+10, pt[1])
+    cv2.putText(img, f'{label}: {angle:.1f}°', label_pos, font, 0.5, color, 1)
+
+def interpolate_point(center_point, visible_pt, angle_offset_deg, rotation_direction):
+    cx, cy = center_point
+    base_angle = angle_between(center_point, visible_pt)
+
+    # Determine direction of offset
+    if rotation_direction == "CCW":
+        use_angle = (base_angle + angle_offset_deg) % 360
+    else:  # CW
+        use_angle = (base_angle - angle_offset_deg) % 360
+
+    # Convert to radians
+    angle_rad = np.radians(use_angle)
+
+    # Calculate interpolated point
+    x = int(cx + avg_length * np.cos(angle_rad))
+    y = int(cy - avg_length * np.sin(angle_rad))  # Subtract because y-axis is downward in image coords
+
+    return (x, y)
+
+
+
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+frame_num = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_num += 1
+    if skip > 1 and frame_num % skip != 0:
+        continue
+    if frame_num % 500 == 0:
+        print(f"[INFO] Processing frame {frame_num}/{total_frames}")
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, green_lower, green_upper)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Filter for circular blobs of reasonable size
+    centers = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 30:
+            M = cv2.moments(cnt)
+            if M["m00"] == 0: continue
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            centers.append((cX, cY))
+            cv2.circle(frame, (cX, cY), 5, (0, 255, 0), -1)
+
+    state = "NOT INITIALIZED"
+    if not initialized and len(centers) == 3:
+        # Compute pairwise distances
+        dists = []
+        for i in range(3):
+            for j in range(i+1, 3):
+                d = np.linalg.norm(np.array(centers[i]) - np.array(centers[j]))
+                dists.append((d, i, j))
+        dists.sort()
+        # Shortest total distance point is center
+        pairs = [dists[0][1], dists[0][2], dists[1][1], dists[1][2]]
+        candidates = [x for x in pairs if pairs.count(x) > 1]
+        center_idx = candidates[0]
+        center_point = centers[center_idx]
+        outer_points = [p for i, p in enumerate(centers) if i != center_idx]
+
+        # Determine which is A and B by clockwise order
+        angles = [angle_between(center_point, p) for p in outer_points]
+        if angles[0] < angles[1]:
+            label_A, label_B = outer_points[0], outer_points[1]
+        else:
+            label_A, label_B = outer_points[1], outer_points[0]
+        start_A = label_A
+        start_B = label_B
+
+        # Set average length and angle diff
+        lengths = [np.linalg.norm(np.array(center_point) - np.array(p)) for p in outer_points]
+        avg_length = sum(lengths) / 2
+        angle_diff = abs(angles[0] - angles[1])
+        angle_diff = 360 - angle_diff if angle_diff > 180 else angle_diff
+
+        initialized = True
+        init_time = time.time()
+
+    if len(centers) < 2:
+        initialized = False
+    if initialized:
+        state = "INITIALIZED"
+        cv2.putText(frame, state, (10, 25), font, 0.8, (0, 255, 0), 2)
+        if recording:
+            current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            angle_A = angle_between(center_point, label_A)
+            record_data.append([current_time, angle_A])
+
+
+        # Draw vertical blue line
+        x = int(center_point[0])
+        y = int(center_point[1] - avg_length)
+        cv2.line(frame, center_point, (x, y), (255, 0, 0), 2)
+
+        # Check visibility of A and B
+        visible = { "A": False, "B": False }
+        for pt in centers:
+            if np.linalg.norm(np.array(pt) - np.array(label_A)) < 100:
+                label_A = pt
+                visible["A"] = True
+                delta = (angle_between(center_point, label_A) - angle_between(center_point, start_A) + 360) % 360
+                rotation_direction = "CCW" if 0 < delta < 180 else "CW"
+            elif np.linalg.norm(np.array(pt) - np.array(label_B)) < 100:
+                label_B = pt
+                visible["B"] = True
+                delta = (angle_between(center_point, label_B) - angle_between(center_point, start_B) + 360) % 360
+                rotation_direction = "CCW" if 0 < delta < 180 else "CW"
+
+        # A
+        if visible["A"]:
+            draw_angle_line(frame, center_point, label_A, (0, 255, 0), "A")
+        else:
+            interp_A = interpolate_point(center_point, label_B, angle_diff, "CW")
+            draw_angle_line(frame, center_point, interp_A, (0, 255, 255), "A")
+            label_A = interp_A
+
+        # B
+        if visible["B"]:
+            draw_angle_line(frame, center_point, label_B, (0, 255, 0), "B")
+        else:
+            interp_B = interpolate_point(center_point, label_A, angle_diff, "CCW")
+            draw_angle_line(frame, center_point, interp_B, (0, 255, 255), "B")
+            label_B = interp_B
+
+        start_A = label_A
+        start_B = label_B
+cap.release()
+
+# Save CSV
+if record_data:
+    with open(record_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_s", "angle_deg"])
+        writer.writerows(record_data)
+    print(f"[INFO] Saved {len(record_data)} data points to {record_filename}")
